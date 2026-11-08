@@ -1,0 +1,3 @@
+# Los scripts de shell y el Dockerfile deben conservar saltos de línea de Linux
+*.sh text eol=lf
+Dockerfile text eol=lf

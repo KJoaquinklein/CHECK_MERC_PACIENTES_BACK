@@ -1,0 +1,1862 @@
+openapi: 3.0.3
+info:
+  title: API de historias clínicas
+  version: 0.1.0
+  description: |
+    Backend del sistema de gestión de historias clínicas de una profesional de la salud.
+
+    **Autenticación.** Sesión del lado del servidor: `POST /auth/login` devuelve una cookie `sid`
+    (`HttpOnly`, `Secure`, `SameSite=Strict`) que el navegador envía sola. El frontend y la API
+    deben estar bajo el **mismo dominio registrable** (por ejemplo `app.midominio.com` y
+    `api.midominio.com`) y las llamadas deben hacerse con `credentials: 'include'`.
+
+    **CSRF.** Todo método que modifica datos (POST, PATCH, DELETE) exige el encabezado
+    `X-Requested-With` con cualquier valor no vacío (por ejemplo `fetch`).
+
+    **Convenciones.**
+    - JSON en español. Los listados son paginados: `?page=1&page_size=25` (máximo 100; 200 en
+      auditoría) y responden `{ "data": [...], "meta": { "page", "page_size", "total" } }`.
+    - Los recursos individuales se devuelven directamente (sin envoltorio).
+    - Nada se borra físicamente: todo `DELETE` es una baja lógica con su operación de restaurar.
+    - Las fechas y horas son ISO 8601 en UTC. Los filtros `desde`/`hasta` y los meses de los
+      reportes son días calendario en hora de `America/Argentina/Cordoba`.
+    - Errores: `{ "error": { "code", "message", "details"?, "request_id"? } }`. Los errores
+      internos (500) solo traen un mensaje genérico y el `request_id` para buscarlo en el log.
+    - Si `API_PREFIX` está configurado en el servidor, todas las rutas llevan ese prefijo.
+servers:
+  - url: /
+    description: Raíz de la API (agregar `API_PREFIX` si el servidor lo define)
+tags:
+  - name: Salud
+  - name: Autenticación
+  - name: Usuarios
+    description: Solo administradores.
+  - name: Obras sociales
+  - name: Pacientes
+  - name: Consultas
+  - name: Archivos
+  - name: Reportes
+  - name: Auditoría
+    description: Solo administradores. Solo lectura.
+security:
+  - cookieAuth: []
+
+paths:
+  /salud:
+    get:
+      tags: [Salud]
+      operationId: salud
+      summary: Comprobación de que el servicio responde
+      description: No consulta la base de datos. Se usa como healthcheck del contenedor.
+      security: []
+      responses:
+        '200':
+          description: El servicio está activo.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [estado]
+                properties:
+                  estado: { type: string, enum: [ok] }
+
+  # ------------------------------------------------------------------ Autenticación
+  /auth/login:
+    post:
+      tags: [Autenticación]
+      operationId: login
+      summary: Iniciar sesión
+      description: |
+        Crea la sesión (12 horas como máximo, 120 minutos sin uso) y responde con la cookie `sid`.
+        Ante cualquier fallo responde siempre `CREDENCIALES_INVALIDAS` (usuario inexistente,
+        inactivo, bloqueado o contraseña incorrecta). Tras 5 fallos seguidos la cuenta se bloquea
+        15 minutos. Hay además un límite de intentos por IP.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [nombre_usuario, password]
+              properties:
+                nombre_usuario: { type: string, description: No distingue mayúsculas. }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Sesión iniciada. Si `debe_cambiar_password` es verdadero, el único uso permitido es cambiarla.
+          headers:
+            Set-Cookie:
+              description: Cookie de sesión `sid` (HttpOnly, Secure, SameSite=Strict).
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsuarioSesion' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401':
+          description: Credenciales inválidas (mensaje genérico).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403': { $ref: '#/components/responses/Csrf' }
+        '429': { $ref: '#/components/responses/DemasiadasPeticiones' }
+
+  /auth/logout:
+    post:
+      tags: [Autenticación]
+      operationId: logout
+      summary: Cerrar sesión
+      description: Revoca la sesión actual. Se permite aunque haya un cambio de contraseña pendiente.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '204': { description: Sesión cerrada. }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Csrf' }
+
+  /auth/me:
+    get:
+      tags: [Autenticación]
+      operationId: yo
+      summary: Usuario de la sesión actual
+      responses:
+        '200':
+          description: Datos del usuario.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsuarioSesion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/DebeCambiarPassword' }
+
+  /auth/cambiar-password:
+    post:
+      tags: [Autenticación]
+      operationId: cambiarPassword
+      summary: Cambiar la contraseña propia
+      description: |
+        La nueva contraseña debe tener entre 10 y 128 caracteres y ser distinta de la actual.
+        Cierra las demás sesiones del usuario. Es la única operación permitida (junto con cerrar
+        sesión) mientras `debe_cambiar_password` sea verdadero.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [actual, nueva]
+              properties:
+                actual: { type: string, format: password }
+                nueva: { type: string, format: password, minLength: 10, maxLength: 128 }
+      responses:
+        '200':
+          description: Contraseña cambiada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Usuario' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Csrf' }
+        '422':
+          description: '`PASSWORD_ACTUAL_INCORRECTA` o `PASSWORD_REPETIDA`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/DemasiadasPeticiones' }
+
+  # ------------------------------------------------------------------ Usuarios
+  /usuarios:
+    get:
+      tags: [Usuarios]
+      operationId: listarUsuarios
+      summary: Listar usuarios
+      parameters:
+        - {
+            name: q,
+            in: query,
+            description: 'Texto en el nombre de usuario o el nombre completo.',
+            schema: { type: string, maxLength: 100 },
+          }
+        - { name: rol, in: query, schema: { $ref: '#/components/schemas/Rol' } }
+        - { name: activo, in: query, schema: { type: boolean } }
+        - name: orden
+          in: query
+          schema:
+            {
+              type: string,
+              enum: [nombre_usuario, nombre_completo, creado_en],
+              default: nombre_completo,
+            }
+        - { $ref: '#/components/parameters/Direccion' }
+        - { $ref: '#/components/parameters/Pagina' }
+        - { $ref: '#/components/parameters/TamanoPagina' }
+      responses:
+        '200':
+          description: Página de usuarios.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginado'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Usuario' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+    post:
+      tags: [Usuarios]
+      operationId: crearUsuario
+      summary: Crear un usuario
+      description: Queda obligado a cambiar la contraseña temporal en su primer ingreso.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [nombre_usuario, nombre_completo, rol, password_temporal]
+              properties:
+                nombre_usuario:
+                  type: string
+                  pattern: '^[a-zA-Z0-9._-]{3,50}$'
+                  description: Se guarda en minúsculas.
+                nombre_completo: { type: string, minLength: 1, maxLength: 200 }
+                rol: { $ref: '#/components/schemas/Rol' }
+                password_temporal: { type: string, format: password, minLength: 10, maxLength: 128 }
+      responses:
+        '201':
+          description: Usuario creado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Usuario' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+        '409':
+          description: '`USUARIO_DUPLICADO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /usuarios/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    get:
+      tags: [Usuarios]
+      operationId: obtenerUsuario
+      summary: Ver un usuario
+      responses:
+        '200':
+          description: El usuario.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Usuario' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    patch:
+      tags: [Usuarios]
+      operationId: editarUsuario
+      summary: Editar nombre, rol o estado de un usuario
+      description: |
+        Nadie puede cambiar su propio rol ni desactivarse (`AUTO_MODIFICACION`) y siempre debe
+        quedar al menos un administrador activo (`ULTIMO_ADMIN`). Desactivar revoca sus sesiones;
+        reactivar limpia el bloqueo por intentos fallidos.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                nombre_completo: { type: string, minLength: 1, maxLength: 200 }
+                rol: { $ref: '#/components/schemas/Rol' }
+                activo: { type: boolean }
+      responses:
+        '200':
+          description: Usuario actualizado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Usuario' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '422': { $ref: '#/components/responses/ReglaDeNegocio' }
+    delete:
+      tags: [Usuarios]
+      operationId: desactivarUsuario
+      summary: Desactivar un usuario (baja lógica)
+      description: Revoca todas sus sesiones. Repetirlo no cambia nada.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Usuario desactivado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Usuario' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '422': { $ref: '#/components/responses/ReglaDeNegocio' }
+
+  /usuarios/{id}/reset-password:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    post:
+      tags: [Usuarios]
+      operationId: restablecerPassword
+      summary: Definir una contraseña temporal
+      description: Fuerza el cambio en el próximo ingreso y revoca sus sesiones. No se puede usar sobre uno mismo.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [password_temporal]
+              properties:
+                password_temporal: { type: string, format: password, minLength: 10, maxLength: 128 }
+      responses:
+        '200':
+          description: Contraseña restablecida.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Usuario' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '422': { $ref: '#/components/responses/ReglaDeNegocio' }
+
+  # ------------------------------------------------------------------ Obras sociales
+  /obras-sociales:
+    get:
+      tags: [Obras sociales]
+      operationId: listarObrasSociales
+      summary: Listar obras sociales
+      description: Para un desplegable usar `activa=true&page_size=100`.
+      parameters:
+        - {
+            name: q,
+            in: query,
+            description: 'Texto en el nombre (sin distinguir tildes ni mayúsculas).',
+            schema: { type: string, maxLength: 100 },
+          }
+        - { name: activa, in: query, schema: { type: boolean } }
+        - { $ref: '#/components/parameters/Direccion' }
+        - { $ref: '#/components/parameters/Pagina' }
+        - { $ref: '#/components/parameters/TamanoPagina' }
+      responses:
+        '200':
+          description: Página de obras sociales.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginado'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ObraSocial' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+    post:
+      tags: [Obras sociales]
+      operationId: crearObraSocial
+      summary: Crear una obra social
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [nombre]
+              properties:
+                nombre: { type: string, minLength: 1, maxLength: 120 }
+      responses:
+        '201':
+          description: Obra social creada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ObraSocial' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '409':
+          description: '`OBRA_SOCIAL_DUPLICADA` (el nombre es único sin distinguir mayúsculas).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /obras-sociales/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    patch:
+      tags: [Obras sociales]
+      operationId: editarObraSocial
+      summary: Renombrar, dar de baja o reactivar una obra social
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                nombre: { type: string, minLength: 1, maxLength: 120 }
+                activa: { type: boolean }
+      responses:
+        '200':
+          description: Obra social actualizada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ObraSocial' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`OBRA_SOCIAL_DUPLICADA`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Obras sociales]
+      operationId: desactivarObraSocial
+      summary: Dar de baja una obra social (baja lógica)
+      description: Los pacientes que ya la tienen asignada la conservan.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Obra social dada de baja.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ObraSocial' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  # ------------------------------------------------------------------ Pacientes
+  /pacientes:
+    get:
+      tags: [Pacientes]
+      operationId: listarPacientes
+      summary: Buscar y listar pacientes
+      description: |
+        `q` busca por palabras (todas deben aparecer, en cualquier orden) en nombre, DNI,
+        número de afiliado, teléfono y email, sin distinguir tildes ni mayúsculas.
+      parameters:
+        - $ref: '#/components/parameters/FiltroPacientesQ'
+        - $ref: '#/components/parameters/FiltroPacientesObraSocial'
+        - $ref: '#/components/parameters/FiltroPacientesActivo'
+        - $ref: '#/components/parameters/FiltroPacientesDesde'
+        - $ref: '#/components/parameters/FiltroPacientesHasta'
+        - name: orden
+          in: query
+          schema: { type: string, enum: [nombre, dni, creado_en, ultima_consulta], default: nombre }
+        - { $ref: '#/components/parameters/Direccion' }
+        - { $ref: '#/components/parameters/Pagina' }
+        - { $ref: '#/components/parameters/TamanoPagina' }
+      responses:
+        '200':
+          description: Página de pacientes.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginado'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/PacienteDeLista' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /pacientes/conteo:
+    get:
+      tags: [Pacientes]
+      operationId: contarPacientes
+      summary: Cantidad de pacientes que cumplen los filtros
+      description: Acepta los mismos filtros que el listado, pero no orden ni paginación.
+      parameters:
+        - $ref: '#/components/parameters/FiltroPacientesQ'
+        - $ref: '#/components/parameters/FiltroPacientesObraSocial'
+        - $ref: '#/components/parameters/FiltroPacientesActivo'
+        - $ref: '#/components/parameters/FiltroPacientesDesde'
+        - $ref: '#/components/parameters/FiltroPacientesHasta'
+      responses:
+        '200':
+          description: Cantidad.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [total]
+                properties:
+                  total: { type: integer }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /pacientes/resumen:
+    get:
+      tags: [Pacientes]
+      operationId: resumenPacientes
+      summary: Consulta rápida de totales
+      description: |
+        `total`, `activos`, `inactivos` y `nuevos_*` cuentan a todos los pacientes; `sin_dni`,
+        `sin_obra_social` y `por_obra_social` solo a los activos. Semana desde el lunes; mes
+        calendario; hora de Córdoba.
+      responses:
+        '200':
+          description: Totales.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResumenPacientes' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /pacientes/paciente:
+    post:
+      tags: [Pacientes]
+      operationId: crearPaciente
+      summary: Alta de un paciente
+      description: Alta rápida, solo `nombre_completo` es obligatorio. Los textos vacíos se guardan como `null`.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PacienteNuevo' }
+      responses:
+        '201':
+          description: Paciente creado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Paciente' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '409':
+          description: '`DNI_DUPLICADO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`OBRA_SOCIAL_INVALIDA` u `OBRA_SOCIAL_INACTIVA`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /pacientes/paciente/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    get:
+      tags: [Pacientes]
+      operationId: verPaciente
+      summary: Ficha del paciente
+      description: Registra `ver_paciente` en la auditoría. También se puede ver un paciente dado de baja.
+      responses:
+        '200':
+          description: Ficha completa con su resumen.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PacienteFicha' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    patch:
+      tags: [Pacientes]
+      operationId: editarPaciente
+      summary: Edición parcial de un paciente
+      description: |
+        El DNI se puede corregir pero no borrar. Un paciente dado de baja no se edita hasta
+        reactivarlo. Las observaciones, al ser texto libre, no se copian a la auditoría.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PacienteEdicion' }
+      responses:
+        '200':
+          description: Paciente actualizado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Paciente' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`DNI_DUPLICADO` o `PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`OBRA_SOCIAL_INVALIDA` u `OBRA_SOCIAL_INACTIVA`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Pacientes]
+      operationId: darDeBajaPaciente
+      summary: Dar de baja a un paciente (baja lógica)
+      description: Conserva sus consultas y archivos. No recibirá consultas ni archivos nuevos.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Paciente dado de baja.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Paciente' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /pacientes/paciente/{id}/reactivar:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    post:
+      tags: [Pacientes]
+      operationId: reactivarPaciente
+      summary: Reactivar a un paciente dado de baja
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Paciente reactivado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Paciente' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  # ------------------------------------------------------------------ Consultas
+  /consultas:
+    get:
+      tags: [Consultas]
+      operationId: listarConsultas
+      summary: Listar consultas
+      description: |
+        Trae la versión vigente de cada consulta (extracto de los primeros 200 caracteres).
+        `q` busca texto completo solo en la versión vigente, sin distinguir tildes.
+      parameters:
+        - { name: id_paciente, in: query, schema: { type: integer, minimum: 1 } }
+        - {
+            name: desde,
+            in: query,
+            description: 'Día inicial de la fecha de la consulta (inclusive).',
+            schema: { type: string, format: date },
+          }
+        - {
+            name: hasta,
+            in: query,
+            description: 'Día final (inclusive).',
+            schema: { type: string, format: date },
+          }
+        - { name: q, in: query, schema: { type: string, maxLength: 200 } }
+        - {
+            name: editadas,
+            in: query,
+            description: 'Solo las que tienen (o no tienen) más de una versión.',
+            schema: { type: boolean },
+          }
+        - { name: incluir_anuladas, in: query, schema: { type: boolean, default: false } }
+        - {
+            name: orden,
+            in: query,
+            schema: { type: string, enum: [fecha_consulta], default: fecha_consulta },
+          }
+        - { name: dir, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+        - { $ref: '#/components/parameters/Pagina' }
+        - { $ref: '#/components/parameters/TamanoPagina' }
+      responses:
+        '200':
+          description: Página de consultas.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginado'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ConsultaDeLista' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+    post:
+      tags: [Consultas]
+      operationId: crearConsulta
+      summary: Registrar una consulta
+      description: |
+        Crea la consulta y su versión 0 en una transacción. El cuerpo admite hasta 450 KB (el
+        contenido, hasta 100.000 caracteres). El paciente debe estar activo.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id_paciente, contenido]
+              properties:
+                id_paciente: { type: integer, minimum: 1 }
+                fecha_consulta:
+                  type: string
+                  format: date-time
+                  description: Con zona horaria. No puede ser futura. Por defecto, ahora.
+                contenido: { type: string, minLength: 1, maxLength: 100000 }
+      responses:
+        '201':
+          description: Consulta creada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Consulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '409':
+          description: '`PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/DemasiadoGrande' }
+        '422':
+          description: '`PACIENTE_INVALIDO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /consultas/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    get:
+      tags: [Consultas]
+      operationId: verConsulta
+      summary: Ver una consulta (versión vigente)
+      description: Registra `ver_consulta` en la auditoría. También se pueden ver las anuladas.
+      responses:
+        '200':
+          description: La consulta.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Consulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    patch:
+      tags: [Consultas]
+      operationId: cambiarFechaConsulta
+      summary: Cambiar la fecha de la consulta
+      description: No crea versiones. Marca la fecha como real (deja de ser estimada). No se permite si está anulada.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [fecha_consulta]
+              properties:
+                fecha_consulta: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Consulta actualizada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Consulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`CONSULTA_ANULADA`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Consultas]
+      operationId: anularConsulta
+      summary: Anular una consulta (baja lógica)
+      description: Se conservan todas sus versiones. Repetirlo no cambia nada.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Consulta anulada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Consulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /consultas/{id}/versiones:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    get:
+      tags: [Consultas]
+      operationId: listarVersionesConsulta
+      summary: Historial completo de versiones
+      description: En orden ascendente (la 0 es el original). Registra `ver_consulta`.
+      responses:
+        '200':
+          description: Todas las versiones.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/VersionConsulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /consultas/{id}/versiones/{version}:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+      - name: version
+        in: path
+        required: true
+        schema: { type: integer, minimum: 0 }
+    get:
+      tags: [Consultas]
+      operationId: verVersionConsulta
+      summary: Una versión puntual
+      description: Registra `ver_consulta`.
+      responses:
+        '200':
+          description: La versión.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VersionConsulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+  /consultas/{id}/ediciones:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    post:
+      tags: [Consultas]
+      operationId: editarConsulta
+      summary: Editar una consulta (crea una versión nueva)
+      description: |
+        Nunca se pisa una versión anterior. `version_base` debe ser la versión vigente que vio
+        quien edita; si otra persona editó antes, responde `CONFLICTO_VERSION` con la versión
+        vigente en `details` y hay que volver a cargar la consulta. Dos ediciones simultáneas con
+        la misma `version_base` producen exactamente un 201 y un 409.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [contenido, version_base]
+              properties:
+                contenido: { type: string, minLength: 1, maxLength: 100000 }
+                version_base: { type: integer, minimum: 0 }
+                motivo_edicion: { type: string, maxLength: 500, nullable: true }
+      responses:
+        '201':
+          description: Versión creada; devuelve la consulta ya con la versión nueva.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Consulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`CONFLICTO_VERSION` (con `details: [{ version_vigente }]`) o `PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413': { $ref: '#/components/responses/DemasiadoGrande' }
+        '422':
+          description: '`CONSULTA_ANULADA` o `CONTENIDO_SIN_CAMBIOS`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /consultas/{id}/restaurar:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    post:
+      tags: [Consultas]
+      operationId: restaurarConsulta
+      summary: Restaurar una consulta anulada
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Consulta restaurada.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Consulta' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ------------------------------------------------------------------ Archivos
+  /archivos:
+    get:
+      tags: [Archivos]
+      operationId: listarArchivos
+      summary: Listar archivos de pacientes
+      parameters:
+        - { name: id_paciente, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: tipo, in: query, schema: { $ref: '#/components/schemas/TipoArchivo' } }
+        - { name: mime_type, in: query, schema: { $ref: '#/components/schemas/MimeArchivo' } }
+        - {
+            name: desde,
+            in: query,
+            description: 'Fecha del documento, desde (inclusive).',
+            schema: { type: string, format: date },
+          }
+        - {
+            name: hasta,
+            in: query,
+            description: 'Fecha del documento, hasta (inclusive).',
+            schema: { type: string, format: date },
+          }
+        - { name: incluir_eliminados, in: query, schema: { type: boolean, default: false } }
+        - {
+            name: orden,
+            in: query,
+            schema: { type: string, enum: [subido_en, fecha_documento], default: subido_en },
+          }
+        - { name: dir, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+        - { $ref: '#/components/parameters/Pagina' }
+        - { $ref: '#/components/parameters/TamanoPagina' }
+      responses:
+        '200':
+          description: Página de archivos (solo metadatos).
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginado'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Archivo' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+    post:
+      tags: [Archivos]
+      operationId: subirArchivo
+      summary: Subir un estudio o una ficha antigua
+      description: |
+        Formulario `multipart/form-data` con un único archivo en el campo `file`. El tipo
+        (PDF, PNG o JPEG) se verifica por el **contenido** del archivo; se ignoran la extensión y
+        el `Content-Type` que declare el cliente. Tamaño máximo según `MAX_UPLOAD_MB` (25 MB por
+        defecto). Las fichas antiguas solo pueden ser imágenes. El paciente debe estar activo.
+        Los campos de texto vacíos se tratan como ausentes.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, id_paciente]
+              properties:
+                file: { type: string, format: binary }
+                id_paciente: { type: integer, minimum: 1 }
+                tipo: { $ref: '#/components/schemas/TipoArchivo' }
+                descripcion: { type: string, maxLength: 2000 }
+                fecha_documento: { type: string, format: date }
+                id_consulta:
+                  type: integer
+                  minimum: 1
+                  description: Debe ser una consulta no anulada del mismo paciente.
+      responses:
+        '201':
+          description: Archivo guardado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Archivo' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '409':
+          description: '`PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: '`ARCHIVO_DEMASIADO_GRANDE`: se corta la transferencia al superar el límite.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '415':
+          description: '`TIPO_NO_PERMITIDO`: el contenido no es PDF, PNG ni JPEG.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`PACIENTE_INVALIDO`, `TIPO_INCOMPATIBLE`, `CONSULTA_INVALIDA` o `CONSULTA_ANULADA`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /archivos/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    get:
+      tags: [Archivos]
+      operationId: verArchivo
+      summary: Metadatos de un archivo
+      description: También de uno eliminado (para poder restaurarlo). Registra `ver_archivo`.
+      responses:
+        '200':
+          description: Metadatos.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Archivo' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+    patch:
+      tags: [Archivos]
+      operationId: editarArchivo
+      summary: Editar los metadatos de un archivo
+      description: 'El contenido (binario) es inmutable: para reemplazarlo se sube un archivo nuevo.'
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                descripcion: { type: string, maxLength: 2000, nullable: true }
+                tipo: { $ref: '#/components/schemas/TipoArchivo' }
+                fecha_documento: { type: string, format: date, nullable: true }
+                id_consulta: { type: integer, minimum: 1, nullable: true }
+      responses:
+        '200':
+          description: Archivo actualizado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Archivo' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`ARCHIVO_ELIMINADO` o `PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: '`TIPO_INCOMPATIBLE`, `CONSULTA_INVALIDA` o `CONSULTA_ANULADA`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    delete:
+      tags: [Archivos]
+      operationId: eliminarArchivo
+      summary: Eliminar un archivo (baja lógica)
+      description: El objeto se conserva en el almacenamiento. Repetirlo no cambia nada.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Archivo eliminado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Archivo' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /archivos/{id}/contenido:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    get:
+      tags: [Archivos]
+      operationId: descargarArchivo
+      summary: Descargar el archivo
+      description: |
+        Descarga autenticada; registra `ver_archivo`. El tipo de contenido sale de la base. No se
+        guarda en cachés (`Cache-Control: private, no-store`). Con `DOWNLOAD_MODE=redirect` y
+        almacenamiento S3 responde un 302 a una URL firmada de corta duración (60 segundos por
+        defecto); si no, transmite el archivo a través de la API.
+      responses:
+        '200':
+          description: El archivo.
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+            image/png:
+              schema: { type: string, format: binary }
+            image/jpeg:
+              schema: { type: string, format: binary }
+        '302':
+          description: Redirección a la URL firmada (solo con almacenamiento S3 y `DOWNLOAD_MODE=redirect`).
+          headers:
+            Location:
+              schema: { type: string, format: uri }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404':
+          description: No existe, está eliminado (`ARCHIVO_ELIMINADO`) o falta en el almacenamiento (`ARCHIVO_NO_DISPONIBLE`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /archivos/{id}/restaurar:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    post:
+      tags: [Archivos]
+      operationId: restaurarArchivo
+      summary: Restaurar un archivo eliminado
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '200':
+          description: Archivo restaurado.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Archivo' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+        '409':
+          description: '`PACIENTE_INACTIVO`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ------------------------------------------------------------------ Reportes
+  /reportes/resumen:
+    get:
+      tags: [Reportes]
+      operationId: reporteResumen
+      summary: Indicadores generales
+      description: '"Del mes" es el mes calendario actual en hora de Córdoba.'
+      parameters:
+        - $ref: '#/components/parameters/Formato'
+      responses:
+        '200':
+          description: Indicadores. Con `formato=csv` son filas `indicador;valor`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResumenGeneral' }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /reportes/consultas-por-mes:
+    get:
+      tags: [Reportes]
+      operationId: reporteConsultasPorMes
+      summary: Consultas por mes
+      description: Consultas no anuladas por mes de su fecha clínica. Los meses sin datos aparecen en cero.
+      parameters:
+        - $ref: '#/components/parameters/ReporteDesde'
+        - $ref: '#/components/parameters/ReporteHasta'
+        - $ref: '#/components/parameters/Formato'
+      responses:
+        '200':
+          description: Serie mensual.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [mes, consultas]
+                      properties:
+                        mes: { type: string, format: date, description: Primer día del mes. }
+                        consultas: { type: integer }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /reportes/pacientes-nuevos-por-mes:
+    get:
+      tags: [Reportes]
+      operationId: reportePacientesNuevosPorMes
+      summary: Altas de pacientes por mes
+      parameters:
+        - $ref: '#/components/parameters/ReporteDesde'
+        - $ref: '#/components/parameters/ReporteHasta'
+        - $ref: '#/components/parameters/Formato'
+      responses:
+        '200':
+          description: Serie mensual.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [mes, pacientes_nuevos]
+                      properties:
+                        mes: { type: string, format: date }
+                        pacientes_nuevos: { type: integer }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /reportes/ediciones-por-mes:
+    get:
+      tags: [Reportes]
+      operationId: reporteEdicionesPorMes
+      summary: Ediciones de consultas por mes
+      description: Versiones nuevas (mayores a 0) y cuántas consultas distintas modificaron.
+      parameters:
+        - $ref: '#/components/parameters/ReporteDesde'
+        - $ref: '#/components/parameters/ReporteHasta'
+        - $ref: '#/components/parameters/Formato'
+      responses:
+        '200':
+          description: Serie mensual.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [mes, ediciones, consultas_modificadas]
+                      properties:
+                        mes: { type: string, format: date }
+                        ediciones: { type: integer }
+                        consultas_modificadas: { type: integer }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /reportes/pacientes-por-obra-social:
+    get:
+      tags: [Reportes]
+      operationId: reportePacientesPorObraSocial
+      summary: Pacientes activos por obra social
+      description: 'Los pacientes sin obra social figuran como "Sin obra social" (`id_obra_social: null`).'
+      parameters:
+        - $ref: '#/components/parameters/Formato'
+      responses:
+        '200':
+          description: Distribución.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id_obra_social, nombre, cantidad]
+                      properties:
+                        id_obra_social: { type: integer, nullable: true }
+                        nombre: { type: string }
+                        cantidad: { type: integer }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  /reportes/consultas-por-paciente:
+    get:
+      tags: [Reportes]
+      operationId: reporteConsultasPorPaciente
+      summary: Ranking de pacientes por cantidad de consultas
+      parameters:
+        - $ref: '#/components/parameters/ReporteDesde'
+        - $ref: '#/components/parameters/ReporteHasta'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        - $ref: '#/components/parameters/Formato'
+      responses:
+        '200':
+          description: Ranking.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id_paciente, nombre_completo, consultas, ultima_consulta]
+                      properties:
+                        id_paciente: { type: integer }
+                        nombre_completo: { type: string }
+                        consultas: { type: integer }
+                        ultima_consulta: { type: string, format: date-time }
+            text/csv:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+
+  # ------------------------------------------------------------------ Auditoría
+  /auditoria:
+    get:
+      tags: [Auditoría]
+      operationId: listarAuditoria
+      summary: Listar registros de auditoría
+      description: Del más reciente al más antiguo. Hasta 200 por página. Listar no genera un registro.
+      parameters:
+        - { name: desde, in: query, schema: { type: string, format: date } }
+        - { name: hasta, in: query, schema: { type: string, format: date } }
+        - { name: id_usuario, in: query, schema: { type: integer, minimum: 1 } }
+        - { name: accion, in: query, schema: { type: string, pattern: '^[a-z0-9_]{1,50}$' } }
+        - { name: entidad, in: query, schema: { type: string, pattern: '^[a-z0-9_]{1,50}$' } }
+        - { name: entidad_id, in: query, schema: { type: integer, minimum: 1 } }
+        - { $ref: '#/components/parameters/Pagina' }
+        - name: page_size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 25 }
+      responses:
+        '200':
+          description: Página de registros.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Paginado'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/RegistroAuditoria' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+
+  /auditoria/acciones:
+    get:
+      tags: [Auditoría]
+      operationId: listarAccionesAuditoria
+      summary: Acciones que existen en la auditoría
+      description: Para armar el filtro por acción.
+      responses:
+        '200':
+          description: Lista ordenada de acciones.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { type: string }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+
+  /auditoria/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdRuta'
+    get:
+      tags: [Auditoría]
+      operationId: verRegistroAuditoria
+      summary: Ver un registro de auditoría
+      description: Abrirlo queda registrado como `auditoria_ver`.
+      responses:
+        '200':
+          description: El registro.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegistroAuditoria' }
+        '400': { $ref: '#/components/responses/Validacion' }
+        '401': { $ref: '#/components/responses/NoAutenticado' }
+        '403': { $ref: '#/components/responses/Prohibido' }
+        '404': { $ref: '#/components/responses/NoEncontrado' }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: sid
+      description: Cookie de sesión que establece `POST /auth/login`.
+
+  parameters:
+    CsrfHeader:
+      name: X-Requested-With
+      in: header
+      required: true
+      description: Obligatorio en POST, PATCH y DELETE (protección CSRF). Cualquier valor no vacío.
+      schema: { type: string, example: fetch }
+    IdRuta:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    Pagina:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    TamanoPagina:
+      name: page_size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+    Direccion:
+      name: dir
+      in: query
+      schema: { type: string, enum: [asc, desc], default: asc }
+    Formato:
+      name: formato
+      in: query
+      description: |
+        `csv` descarga un archivo UTF-8 con BOM, separador `;` (configurable) y las celdas que
+        empiezan con `=`, `+`, `-` o `@` neutralizadas contra inyección de fórmulas.
+      schema: { type: string, enum: [json, csv], default: json }
+    ReporteDesde:
+      name: desde
+      in: query
+      description: Día inicial (inclusive), hora de Córdoba. Entre 1900 y 2100.
+      schema: { type: string, format: date }
+    ReporteHasta:
+      name: hasta
+      in: query
+      description: Día final (inclusive), hora de Córdoba. Entre 1900 y 2100.
+      schema: { type: string, format: date }
+    FiltroPacientesQ:
+      name: q
+      in: query
+      description: Palabras a buscar en nombre, DNI, afiliado, teléfono y email.
+      schema: { type: string, maxLength: 100 }
+    FiltroPacientesObraSocial:
+      name: id_obra_social
+      in: query
+      schema: { type: integer, minimum: 1 }
+    FiltroPacientesActivo:
+      name: activo
+      in: query
+      schema: { type: string, enum: ['true', 'false', todos], default: 'true' }
+    FiltroPacientesDesde:
+      name: creado_desde
+      in: query
+      description: Día de alta inicial (inclusive), hora de Córdoba.
+      schema: { type: string, format: date }
+    FiltroPacientesHasta:
+      name: creado_hasta
+      in: query
+      description: Día de alta final (inclusive), hora de Córdoba.
+      schema: { type: string, format: date }
+
+  responses:
+    Validacion:
+      description: '`VALIDACION`: datos, parámetros o id inválidos. `details` indica el campo.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NoAutenticado:
+      description: '`NO_AUTENTICADO`: sin sesión, vencida o revocada.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Prohibido:
+      description: '`PROHIBIDO`: el rol no tiene permiso, o `DEBE_CAMBIAR_PASSWORD` si hay un cambio de contraseña pendiente.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DebeCambiarPassword:
+      description: '`DEBE_CAMBIAR_PASSWORD`: hay que cambiar la contraseña antes de continuar.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Csrf:
+      description: '`CSRF`: falta el encabezado `X-Requested-With`.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NoEncontrado:
+      description: '`NO_ENCONTRADO`: el recurso no existe.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ReglaDeNegocio:
+      description: 'Regla de negocio no cumplida (`AUTO_MODIFICACION`, `ULTIMO_ADMIN`, ...).'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DemasiadoGrande:
+      description: '`PAYLOAD_DEMASIADO_GRANDE`: el cuerpo supera el límite.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DemasiadasPeticiones:
+      description: '`DEMASIADOS_INTENTOS`: límite de peticiones por IP superado.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: VALIDACION }
+            message: { type: string }
+            details:
+              type: array
+              items: {}
+              description: Detalle por campo (`VALIDACION`) o datos del conflicto (`CONFLICTO_VERSION`).
+            request_id:
+              type: string
+              format: uuid
+              description: Solo en errores internos (500).
+    Paginado:
+      type: object
+      required: [data, meta]
+      properties:
+        data: { type: array, items: {} }
+        meta:
+          type: object
+          required: [page, page_size, total]
+          properties:
+            page: { type: integer }
+            page_size: { type: integer }
+            total: { type: integer }
+    Rol:
+      type: string
+      enum: [admin, profesional]
+    UsuarioSesion:
+      type: object
+      required: [id, nombre_usuario, nombre_completo, rol, debe_cambiar_password]
+      properties:
+        id: { type: integer }
+        nombre_usuario: { type: string }
+        nombre_completo: { type: string }
+        rol: { $ref: '#/components/schemas/Rol' }
+        debe_cambiar_password: { type: boolean }
+    Usuario:
+      allOf:
+        - $ref: '#/components/schemas/UsuarioSesion'
+        - type: object
+          required: [activo, bloqueado_hasta, ultimo_login, creado_en]
+          properties:
+            activo: { type: boolean }
+            bloqueado_hasta: { type: string, format: date-time, nullable: true }
+            ultimo_login: { type: string, format: date-time, nullable: true }
+            creado_en: { type: string, format: date-time }
+    ObraSocial:
+      type: object
+      required: [id, nombre, activa]
+      properties:
+        id: { type: integer }
+        nombre: { type: string }
+        activa: { type: boolean }
+    ObraSocialResumen:
+      type: object
+      required: [id, nombre]
+      properties:
+        id: { type: integer }
+        nombre: { type: string }
+    PacienteNuevo:
+      type: object
+      additionalProperties: false
+      required: [nombre_completo]
+      properties:
+        nombre_completo: { type: string, minLength: 1, maxLength: 200 }
+        dni:
+          type: string
+          nullable: true
+          description: 6 a 9 dígitos; se aceptan puntos, espacios y guiones (se guarda solo con dígitos). Único entre pacientes.
+        fecha_nacimiento: { type: string, format: date, nullable: true }
+        telefono: { type: string, maxLength: 50, nullable: true }
+        email: { type: string, format: email, maxLength: 200, nullable: true }
+        domicilio: { type: string, maxLength: 300, nullable: true }
+        id_obra_social:
+          { type: integer, minimum: 1, nullable: true, description: Debe existir y estar activa. }
+        nro_afiliado: { type: string, maxLength: 50, nullable: true }
+        observaciones: { type: string, maxLength: 5000, nullable: true }
+    PacienteEdicion:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        nombre_completo: { type: string, minLength: 1, maxLength: 200 }
+        dni: { type: string, description: Se puede corregir pero no borrar. }
+        fecha_nacimiento: { type: string, format: date, nullable: true }
+        telefono: { type: string, maxLength: 50, nullable: true }
+        email: { type: string, format: email, maxLength: 200, nullable: true }
+        domicilio: { type: string, maxLength: 300, nullable: true }
+        id_obra_social: { type: integer, minimum: 1, nullable: true }
+        nro_afiliado: { type: string, maxLength: 50, nullable: true }
+        observaciones: { type: string, maxLength: 5000, nullable: true }
+    Paciente:
+      type: object
+      required:
+        [
+          id,
+          nombre_completo,
+          dni,
+          fecha_nacimiento,
+          telefono,
+          email,
+          domicilio,
+          id_obra_social,
+          obra_social,
+          nro_afiliado,
+          observaciones,
+          activo,
+          creado_en,
+          actualizado_en,
+        ]
+      properties:
+        id: { type: integer }
+        nombre_completo: { type: string }
+        dni: { type: string, nullable: true }
+        fecha_nacimiento: { type: string, format: date, nullable: true }
+        telefono: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        domicilio: { type: string, nullable: true }
+        id_obra_social: { type: integer, nullable: true }
+        obra_social:
+          type: object
+          nullable: true
+          required: [id, nombre, activa]
+          properties:
+            id: { type: integer }
+            nombre: { type: string }
+            activa: { type: boolean }
+        nro_afiliado: { type: string, nullable: true }
+        observaciones: { type: string, nullable: true }
+        activo: { type: boolean }
+        creado_en: { type: string, format: date-time }
+        actualizado_en: { type: string, format: date-time }
+    PacienteFicha:
+      allOf:
+        - $ref: '#/components/schemas/Paciente'
+        - type: object
+          required: [resumen]
+          properties:
+            resumen:
+              type: object
+              required: [total_consultas, ultima_consulta, total_archivos]
+              properties:
+                total_consultas: { type: integer, description: Sin contar las anuladas. }
+                ultima_consulta: { type: string, format: date-time, nullable: true }
+                total_archivos: { type: integer, description: Sin contar los eliminados. }
+    PacienteDeLista:
+      type: object
+      properties:
+        id: { type: integer }
+        nombre_completo: { type: string }
+        dni: { type: string, nullable: true }
+        fecha_nacimiento: { type: string, format: date, nullable: true }
+        telefono: { type: string, nullable: true }
+        email: { type: string, nullable: true }
+        nro_afiliado: { type: string, nullable: true }
+        activo: { type: boolean }
+        creado_en: { type: string, format: date-time }
+        obra_social:
+          allOf:
+            - $ref: '#/components/schemas/ObraSocialResumen'
+          nullable: true
+        ultima_consulta: { type: string, format: date-time, nullable: true }
+        total_consultas: { type: integer }
+    ResumenPacientes:
+      type: object
+      properties:
+        total: { type: integer }
+        activos: { type: integer }
+        inactivos: { type: integer }
+        nuevos_hoy: { type: integer }
+        nuevos_semana: { type: integer }
+        nuevos_mes: { type: integer }
+        sin_dni: { type: integer }
+        sin_obra_social: { type: integer }
+        por_obra_social:
+          type: array
+          items:
+            type: object
+            properties:
+              id_obra_social: { type: integer }
+              nombre: { type: string }
+              cantidad: { type: integer }
+    PersonaResumen:
+      type: object
+      nullable: true
+      properties:
+        id: { type: integer }
+        nombre_completo: { type: string }
+    Consulta:
+      type: object
+      properties:
+        id: { type: integer }
+        id_paciente: { type: integer }
+        paciente:
+          type: object
+          properties:
+            id: { type: integer }
+            nombre_completo: { type: string }
+        fecha_consulta: { type: string, format: date-time }
+        fecha_estimada:
+          { type: boolean, description: Verdadero en consultas migradas sin fecha real. }
+        anulada: { type: boolean }
+        creado_en: { type: string, format: date-time }
+        creada_por: { $ref: '#/components/schemas/PersonaResumen' }
+        version_actual: { type: integer, description: Número de la versión vigente (0 = original). }
+        contenido: { type: string, description: Texto de la versión vigente. }
+        motivo_edicion: { type: string, nullable: true }
+        editado_en:
+          { type: string, format: date-time, description: Cuándo se creó la versión vigente. }
+        editado_por: { $ref: '#/components/schemas/PersonaResumen' }
+        fue_editada: { type: boolean }
+        total_versiones: { type: integer }
+    ConsultaDeLista:
+      type: object
+      properties:
+        id: { type: integer }
+        id_paciente: { type: integer }
+        paciente:
+          type: object
+          properties:
+            id: { type: integer }
+            nombre_completo: { type: string }
+        fecha_consulta: { type: string, format: date-time }
+        fecha_estimada: { type: boolean }
+        anulada: { type: boolean }
+        version_actual: { type: integer }
+        fue_editada: { type: boolean }
+        extracto: { type: string, description: Primeros 200 caracteres de la versión vigente. }
+    VersionConsulta:
+      type: object
+      properties:
+        version: { type: integer }
+        contenido: { type: string }
+        motivo_edicion: { type: string, nullable: true }
+        creado_en: { type: string, format: date-time }
+        usuario: { $ref: '#/components/schemas/PersonaResumen' }
+    TipoArchivo:
+      type: string
+      enum: [estudio, ficha_antigua]
+      default: estudio
+    MimeArchivo:
+      type: string
+      enum: [application/pdf, image/png, image/jpeg]
+    Archivo:
+      type: object
+      properties:
+        id: { type: integer }
+        id_paciente: { type: integer }
+        id_consulta: { type: integer, nullable: true }
+        tipo: { $ref: '#/components/schemas/TipoArchivo' }
+        descripcion: { type: string, nullable: true }
+        fecha_documento: { type: string, format: date, nullable: true }
+        nombre_original: { type: string }
+        mime_type: { $ref: '#/components/schemas/MimeArchivo' }
+        tamano_bytes: { type: integer }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        eliminado: { type: boolean }
+        eliminado_en: { type: string, format: date-time, nullable: true }
+        creado_en: { type: string, format: date-time }
+        subido_en: { type: string, format: date-time }
+        subido_por: { $ref: '#/components/schemas/PersonaResumen' }
+    ResumenGeneral:
+      type: object
+      properties:
+        pacientes_total: { type: integer }
+        pacientes_activos: { type: integer }
+        consultas_total: { type: integer, description: Sin contar las anuladas. }
+        consultas_del_mes: { type: integer }
+        ediciones_del_mes: { type: integer }
+        archivos_total: { type: integer, description: Sin contar los eliminados. }
+        archivos_estudios: { type: integer }
+        archivos_fichas_antiguas: { type: integer }
+    RegistroAuditoria:
+      type: object
+      properties:
+        id: { type: integer }
+        fecha: { type: string, format: date-time }
+        usuario:
+          type: object
+          nullable: true
+          properties:
+            id: { type: integer }
+            nombre_usuario: { type: string }
+            nombre_completo: { type: string }
+        accion: { type: string, example: ver_paciente }
+        entidad: { type: string, nullable: true }
+        entidad_id: { type: integer, nullable: true }
+        ip: { type: string, nullable: true }
+        detalle:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: Ids y nombres de campos. Nunca texto clínico ni contraseñas.

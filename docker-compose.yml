@@ -1,0 +1,52 @@
+# Servicios para desarrollo y tests en una máquina con Docker: PostgreSQL 16 y un almacenamiento
+# S3-compatible (MinIO). NO se usa en producción (allí van PostgreSQL administrado y un bucket real).
+#
+# Aviso: este archivo no se pudo probar en la máquina donde se desarrolló el proyecto (sin Docker);
+# si algo falla al levantarlo, corregirlo y avisar.
+#
+#   docker compose up -d
+#   ADMIN_DATABASE_URL=postgres://postgres:postgres@localhost:5432/historias_clinicas  npm run crear-roles
+#   (repetir con .../historias_clinicas_test para la base de tests)
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: historias_clinicas
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-datos:/var/lib/postgresql/data
+      - ./docker/crear-base-de-pruebas.sql:/docker-entrypoint-initdb.d/10-base-de-pruebas.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    command: server /datos --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio-local
+      MINIO_ROOT_PASSWORD: minio-local-clave
+    ports:
+      - '9000:9000'
+      - '9001:9001'
+    volumes:
+      - minio-datos:/datos
+
+  # Crea el bucket privado de pruebas y termina
+  minio-bucket:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 minio-local minio-local-clave; do sleep 1; done;
+      mc mb --ignore-existing local/historias-clinicas-test;
+      "
+
+volumes:
+  postgres-datos:
+  minio-datos:
